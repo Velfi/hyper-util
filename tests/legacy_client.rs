@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::task::Poll;
 use std::thread;
 use std::time::Duration;
@@ -23,6 +24,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
 use test_utils::{DebugConnector, DebugStream};
+use tokio::task::yield_now;
 
 pub fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -93,7 +95,7 @@ async fn drop_client_closes_idle_connections() {
     let (closes_tx, mut closes) = mpsc::channel(10);
 
     let (tx1, rx1) = oneshot::channel();
-    let (_client_drop_tx, client_drop_rx) = oneshot::channel::<()>();
+    let (client_drop_tx, client_drop_rx) = oneshot::channel::<()>();
 
     thread::spawn(move || {
         let mut sock = server.accept().unwrap().0;
@@ -129,25 +131,31 @@ async fn drop_client_closes_idle_connections() {
     let res = client.request(req).map_ok(move |res| {
         assert_eq!(res.status(), hyper::StatusCode::OK);
     });
-    let rx = rx1;
-    let (res, _) = future::join(res, rx).await;
+
+    let (res, _) = future::join(res, rx1).await;
     res.unwrap();
+
+    yield_now().await;
 
     // not closed yet, just idle
     future::poll_fn(|ctx| {
-        assert!(Pin::new(&mut closes).poll_next(ctx).is_pending());
+        let poll_res = Pin::new(&mut closes).poll_next(ctx);
+        assert!(
+            poll_res.is_pending(),
+            "expected pending poll but got {:?}",
+            poll_res
+        );
         Poll::Ready(())
     })
     .await;
 
     // drop to start the connections closing
     drop(client);
-
-    // and wait a few ticks for the connections to close
-    let t = tokio::time::sleep(Duration::from_millis(100)).map(|_| panic!("time out"));
-    futures_util::pin_mut!(t);
+    drop(client_drop_tx);
+    // and yield so the connection has a chance to close
+    yield_now().await;
     let close = closes.into_future().map(|(opt, _)| opt.expect("closes"));
-    future::select(t, close).await;
+    close.await;
 }
 
 #[cfg(not(miri))]
@@ -891,7 +899,6 @@ fn capture_connection_on_client() {
     let addr = server.local_addr().unwrap();
     thread::spawn(move || {
         let mut sock = server.accept().unwrap().0;
-        //drop(server);
         sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         sock.set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -907,4 +914,75 @@ fn capture_connection_on_client() {
     let captured_conn = capture_connection(&mut req);
     rt.block_on(client.request(req)).expect("200 OK");
     assert!(captured_conn.connection_metadata().is_some());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn connection_poisoning() {
+    use std::sync::atomic::AtomicUsize;
+
+    let _ = pretty_env_logger::try_init();
+
+    let rt = runtime();
+    let connector = DebugConnector::new();
+
+    let client = Client::builder(TokioExecutor::new()).build(connector);
+
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    let num_conns: Arc<AtomicUsize> = Default::default();
+    let num_requests: Arc<AtomicUsize> = Default::default();
+    let num_requests_tracker = num_requests.clone();
+    let num_conns_tracker = num_conns.clone();
+    thread::spawn(move || loop {
+        let mut sock = server.accept().unwrap().0;
+        num_conns_tracker.fetch_add(1, Ordering::Relaxed);
+        let num_requests_tracker = num_requests_tracker.clone();
+        thread::spawn(move || {
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buf = [0; 4096];
+            loop {
+                if sock.read(&mut buf).expect("read 1") > 0 {
+                    sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .expect("write 1");
+                    num_requests_tracker.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+    });
+    let make_request = || {
+        Request::builder()
+            .uri(&*format!("http://{}/a", addr))
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+    let mut req = make_request();
+    let captured_conn = capture_connection(&mut req);
+    rt.block_on(client.request(req)).expect("200 OK");
+    assert_eq!(num_conns.load(Ordering::SeqCst), 1);
+    assert_eq!(num_requests.load(Ordering::SeqCst), 1);
+
+    rt.block_on(client.request(make_request())).expect("200 OK");
+    rt.block_on(client.request(make_request())).expect("200 OK");
+    // Before poisoning the connection is reused
+    assert_eq!(num_conns.load(Ordering::SeqCst), 1);
+    assert_eq!(num_requests.load(Ordering::SeqCst), 3);
+    captured_conn
+        .connection_metadata()
+        .as_ref()
+        .unwrap()
+        .poison();
+
+    rt.block_on(client.request(make_request())).expect("200 OK");
+
+    // After poisoning, a new connection is established
+    assert_eq!(num_conns.load(Ordering::SeqCst), 2);
+    assert_eq!(num_requests.load(Ordering::SeqCst), 4);
+
+    rt.block_on(client.request(make_request())).expect("200 OK");
+    // another request can still reuse:
+    assert_eq!(num_conns.load(Ordering::SeqCst), 2);
+    assert_eq!(num_requests.load(Ordering::SeqCst), 5);
 }
