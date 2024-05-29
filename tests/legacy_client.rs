@@ -137,7 +137,11 @@ async fn drop_client_closes_idle_connections() {
     // not closed yet, just idle
     future::poll_fn(|ctx| {
         let poll_res = Pin::new(&mut closes).poll_next(ctx);
-        assert!(poll_res.is_pending(), "expected pending poll but got {:?}", poll_res);
+        assert!(
+            poll_res.is_pending(),
+            "expected pending poll but got {:?}",
+            poll_res
+        );
         Poll::Ready(())
     })
     .await;
