@@ -24,6 +24,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
 use test_utils::{DebugConnector, DebugStream};
+use tokio::task::yield_now;
 
 pub fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -84,7 +85,7 @@ fn drop_body_before_eof_closes_connection() {
     rt.block_on(closes.into_future()).0.expect("closes");
 }
 
-#[cfg(not(miri))]
+// #[cfg(not(miri))]
 #[tokio::test]
 async fn drop_client_closes_idle_connections() {
     let _ = pretty_env_logger::try_init();
@@ -130,9 +131,11 @@ async fn drop_client_closes_idle_connections() {
     let res = client.request(req).map_ok(move |res| {
         assert_eq!(res.status(), hyper::StatusCode::OK);
     });
-    let rx = rx1;
-    let (res, _) = future::join(res, rx).await;
+
+    let (res, _) = future::join(res, rx1).await;
     res.unwrap();
+
+    yield_now().await;
 
     // not closed yet, just idle
     future::poll_fn(|ctx| {
