@@ -731,7 +731,7 @@ impl<B> PoolClient<B> {
     }
 
     fn is_poisoned(&self) -> bool {
-        self.conn_info.poisoned.poisoned()
+        self.conn_info.poisoned.is_poisoned()
     }
 
     fn is_ready(&self) -> bool {

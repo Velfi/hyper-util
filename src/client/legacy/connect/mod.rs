@@ -130,8 +130,12 @@ impl PoisonPill {
         self.poisoned.store(true, Ordering::Relaxed)
     }
 
-    pub(crate) fn poisoned(&self) -> bool {
+    pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_healthy(&self) -> bool {
+        !self.is_poisoned()
     }
 }
 
