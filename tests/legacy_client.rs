@@ -85,7 +85,7 @@ fn drop_body_before_eof_closes_connection() {
     rt.block_on(closes.into_future()).0.expect("closes");
 }
 
-// #[cfg(not(miri))]
+#[cfg(not(miri))]
 #[tokio::test]
 async fn drop_client_closes_idle_connections() {
     let _ = pretty_env_logger::try_init();
@@ -95,7 +95,7 @@ async fn drop_client_closes_idle_connections() {
     let (closes_tx, mut closes) = mpsc::channel(10);
 
     let (tx1, rx1) = oneshot::channel();
-    let (_client_drop_tx, client_drop_rx) = oneshot::channel::<()>();
+    let (client_drop_tx, client_drop_rx) = oneshot::channel::<()>();
 
     thread::spawn(move || {
         let mut sock = server.accept().unwrap().0;
@@ -151,12 +151,11 @@ async fn drop_client_closes_idle_connections() {
 
     // drop to start the connections closing
     drop(client);
-
-    // and wait a few ticks for the connections to close
-    let t = tokio::time::sleep(Duration::from_millis(100)).map(|_| panic!("time out"));
-    futures_util::pin_mut!(t);
+    drop(client_drop_tx);
+    // and yield so the connection has a chance to close
+    yield_now().await;
     let close = closes.into_future().map(|(opt, _)| opt.expect("closes"));
-    future::select(t, close).await;
+    close.await;
 }
 
 #[cfg(not(miri))]
